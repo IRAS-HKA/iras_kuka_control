@@ -5,6 +5,10 @@
 #include <string>
 #include <map>
 #include <boost/asio.hpp>
+#include <boost/array.hpp>
+#include <boost/thread.hpp>
+#include <boost/thread/future.hpp>
+#include <boost/chrono.hpp>
 #include <tinyxml2.h>
 
 // ROS2
@@ -74,11 +78,22 @@ namespace kuka_eki_io_interface
             std::vector<std::string> orderedNonCommandStateKeys_;
             int lastRequestId_;
 
+            // RT Decoupling
+            boost::mutex mutex_read_;
+            boost::mutex mutex_write_;
+            boost::atomic<bool> async_read_running{false};
+            boost::atomic<bool> async_write_running{false};
+            boost::unique_future<hardware_interface::return_type> async_read_future_;
+            boost::unique_future<hardware_interface::return_type> async_write_future_;
+            boost::promise<hardware_interface::return_type> read_promise_;
+
+            boost::array<char, 2048> inBuffer_;
+
             // EKI socket read/write
             int eki_read_state_timeout_ = 5;  // [ms], settable by parameter (default = 5)
-            IoService ios_;
+            boost::asio::io_context io_context_;
             DeadlineTimerPtr deadline_;
-            Endpoint eki_server_endpoint_;
+            boost::asio::ip::udp::endpoint eki_server_endpoint_;
             SocketPtr eki_server_socket_;
 
             // Setup
@@ -90,10 +105,13 @@ namespace kuka_eki_io_interface
             std::string removeInterfacePrefix(const std::string& interfaceName, const std::string& prefixName);
 
             // Read states
-            hardware_interface::return_type eki_read_state();
+            hardware_interface::return_type eki_read_state(std::size_t receivedMessageLength);
             hardware_interface::return_type readIoValuesFromXmlIo(tinyxml2::XMLElement* xmlIo, int& key, bool& value);
             hardware_interface::return_type getNonCommandStateFullNameByKey(const std::string& key, std::string& fullname);
             hardware_interface::return_type getCommandStateFullNameByKey(const std::string& key, std::string& fullname);
+
+            void handle_receive(const boost::system::error_code& error, std::size_t bytes_transferred);
+            
 
             // Write commands
             bool isCommandUpdateRequired();

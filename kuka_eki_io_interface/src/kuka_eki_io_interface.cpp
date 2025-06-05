@@ -15,10 +15,16 @@ namespace kuka_eki_io_interface
         auto logger = rclcpp::get_logger(LOGGER_NAME);
         RCLCPP_INFO(logger, "on_init() called.");
 
+        // Initialize futures so is_ready() will work from the first read/write cycle.
+        boost::promise<hardware_interface::return_type> write_promise;
+        async_read_future_ = read_promise_.get_future();
+        async_write_future_ = write_promise.get_future();
+        read_promise_.set_value(hardware_interface::return_type::OK);
+        write_promise.set_value(hardware_interface::return_type::OK);
+
         if (hardware_interface::SystemInterface::on_init(info) != hardware_interface::CallbackReturn::SUCCESS)
             return hardware_interface::CallbackReturn::ERROR;
 
-        
         if (info_.gpios.size() > __maxIoNumber) {
             RCLCPP_FATAL(logger, "on_init() called. Detected %ld GPIOs. Hardware Interface supports only %i GPIOs.", info_.gpios.size() , __maxIoNumber);
             return hardware_interface::CallbackReturn::ERROR;
@@ -46,10 +52,10 @@ namespace kuka_eki_io_interface
         auto logger = rclcpp::get_logger(LOGGER_NAME);
         RCLCPP_INFO(logger, "on_activate() called. Previous state was [ %i, %s ]", previous_state.id(), previous_state.label().c_str());        
 
-        deadline_.reset(new boost::asio::deadline_timer(ios_));
-        eki_server_socket_.reset(new boost::asio::ip::udp::socket(ios_, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0)));
+        //deadline_.reset(new boost::asio::deadline_timer(io_context_));
+        eki_server_socket_.reset(new boost::asio::ip::udp::socket(io_context_, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0)));
 
-        boost::asio::ip::udp::resolver resolver(ios_);
+        boost::asio::ip::udp::resolver resolver(io_context_);
         eki_server_endpoint_ = *resolver.resolve({boost::asio::ip::udp::v4(), eki_server_address_, eki_io_port_});
 
         // Initiate contact to start server. Do nothing until a read is invoked (deadline_ = +inf)
@@ -57,8 +63,8 @@ namespace kuka_eki_io_interface
         eki_server_socket_->send_to(boost::asio::buffer(ini_buf), eki_server_endpoint_);
 
         // Start persistent actor to check for eki_read_state timeouts.
-        deadline_->expires_at(boost::posix_time::pos_infin);  // 
-        eki_check_read_state_deadline();
+        //deadline_->expires_at(boost::posix_time::pos_infin);  // 
+        //eki_check_read_state_deadline();
 
         RCLCPP_INFO(logger, "KUKA EKI IO interface activated.");
         return hardware_interface::CallbackReturn::SUCCESS;
@@ -241,31 +247,59 @@ namespace kuka_eki_io_interface
 
     hardware_interface::return_type KukaEkiIoInterface::read(const rclcpp::Time& time, const rclcpp::Duration& period) {
         auto logger = rclcpp::get_logger(LOGGER_NAME);
-        RCLCPP_DEBUG(logger, "write() called. Time=[%f , %li] Duration=[ %f , %li ]", time.seconds(), time.nanoseconds(), period.seconds(), period.nanoseconds());
+        RCLCPP_DEBUG(logger, "read() called. Time=[%f , %li] Duration=[ %f , %li ]", time.seconds(), time.nanoseconds(), period.seconds(), period.nanoseconds());
 
-        if (eki_read_state() == hardware_interface::return_type::ERROR) {
-            std::string msg = "Failed to read from robot EKI server within alloted time of " + std::to_string(eki_read_state_timeout_) + " seconds. Make sure kuka_eki_io_interface is running on the robot controller and all configurations are correct.";
-            RCLCPP_ERROR(logger, msg.c_str());
-            RCLCPP_ERROR(logger, "Configured EKI Server Address: %s", eki_server_address_.c_str());
-            RCLCPP_ERROR(logger, "Configured EKI Server Port   : %s", eki_io_port_.c_str());
-            return hardware_interface::return_type::ERROR;
+        if (mutex_read_.try_lock()) {
+            if (async_read_future_.is_ready()) {
+                // Return error based of last futures result.
+                if (async_read_future_.get() == hardware_interface::return_type::ERROR) {
+                    std::string msg = "Failed to read async to EKI server. Returning ERROR."; //  within alloted time of " + std::to_string(eki_read_state_timeout_) + " seconds. Make sure eki_io_interface is running on the robot controller and all configurations are correct.";
+                    RCLCPP_ERROR(logger, msg.c_str());
+                    RCLCPP_ERROR(logger, "Configured EKI Server Address: %s", eki_server_address_.c_str());
+                    RCLCPP_ERROR(logger, "Configured EKI Server Port   : %s", eki_io_port_.c_str());
+                    return hardware_interface::return_type::ERROR;
+                }
+
+                // Read the next eki state.
+                std::fill(inBuffer_.begin(), inBuffer_.end(), 0);
+                read_promise_ = boost::promise<hardware_interface::return_type>();
+                async_read_future_ = read_promise_.get_future();
+                eki_server_socket_->async_receive(boost::asio::buffer(inBuffer_),
+                    [this](const boost::system::error_code& error, std::size_t bytes_transferred) {
+                        return handle_receive(error, bytes_transferred);
+                    });
+                //async_read_future_ = boost::async([this]() { return start_receive(); });
+            }
         }
 
         return hardware_interface::return_type::OK;
     }
 
-    hardware_interface::return_type KukaEkiIoInterface::eki_read_state() {
+
+
+    void KukaEkiIoInterface::handle_receive(const boost::system::error_code& error, std::size_t bytes_transferred) {
+        auto logger = rclcpp::get_logger(LOGGER_NAME);
+        
+        if (!error) {
+            auto received_data = inBuffer_.data();
+            RCLCPP_INFO(logger, "Async received: %s", std::string(received_data, bytes_transferred).c_str());
+            read_promise_.set_value(hardware_interface::return_type::OK);
+        } else {
+            RCLCPP_ERROR(logger, "Error when async_receive: %s", error.message().c_str());
+            read_promise_.set_value(hardware_interface::return_type::ERROR);
+        }
+    }
+
+    hardware_interface::return_type KukaEkiIoInterface::eki_read_state(std::size_t receivedMessageLength) {
         auto logger = rclcpp::get_logger(LOGGER_NAME);
 
-        // Declarations & Allocations
-        static boost::array<char, 2048> inBuffer;
 
         // Read socket buffer (with timeout) // Based off of Boost documentation example: doc/html/boost_asio/example/timeouts/blocking_udp_client.cpp
-        deadline_->expires_from_now(boost::posix_time::milliseconds(eki_read_state_timeout_));
-        boost::system::error_code systemErrorCode = boost::asio::error::would_block;
-        size_t receivedMessageLength = 0;
+        // deadline_->expires_from_now(boost::posix_time::milliseconds(eki_read_state_timeout_));
+        // boost::system::error_code systemErrorCode = boost::asio::error::would_block;
+        // size_t receivedMessageLength = 0;
 
-        eki_server_socket_->async_receive(boost::asio::buffer(inBuffer), boost::bind(&KukaEkiIoInterface::eki_handle_receive, _1, _2, &systemErrorCode, &receivedMessageLength));
+        //eki_server_socket_->async_receive(boost::asio::buffer(inBuffer), boost::bind(&KukaEkiIoInterface::eki_handle_receive, _1, _2, &systemErrorCode, &receivedMessageLength));
         // eki_server_socket_->async_receive(
         //     boost::asio::buffer(inBuffer),
         //     [&systemErrorCode, &receivedMessageLength](const boost::system::error_code& errorCode, std::size_t length) {
@@ -274,27 +308,27 @@ namespace kuka_eki_io_interface
         //     }
         // );
 
-        do
-            ios_.run_one();
-        while (systemErrorCode == boost::asio::error::would_block);
+        // do
+        //     io_context_.run_one();
+        // while (systemErrorCode == boost::asio::error::would_block);
 
-        deadline_->expires_at(boost::posix_time::pos_infin);
+        // deadline_->expires_at(boost::posix_time::pos_infin);
 
         // KUKAEKIIO_00001 // KUKAEKIIO_00002 // Log warning when errorcode is set and do not continue processing.
-        if (systemErrorCode) {
-            RCLCPP_DEBUG(logger, "communication error code: %s", systemErrorCode.message().c_str());
-            return hardware_interface::return_type::OK;
-        }
+        // if (systemErrorCode) {
+        //     RCLCPP_DEBUG(logger, "communication error code: %s", systemErrorCode.message().c_str());
+        //     return hardware_interface::return_type::OK;
+        // }
 
         // KUKAEKIIO_00003 // KUKAEKIIO_00004 // Log warning when packages with zero lenght are received and do not continue processing.
-        if (receivedMessageLength == 0) {
-            RCLCPP_WARN(logger, "message of length 0 received.");
-            return hardware_interface::return_type::OK;
-        }
+        // if (receivedMessageLength == 0) {
+        //     RCLCPP_WARN(logger, "message of length 0 received.");
+        //     return hardware_interface::return_type::OK;
+        // }
 
         // KUKAEKIIO_00006 // Materialize incoming c-string as XML DOM.  
         tinyxml2::XMLDocument xmlDocument;
-        tinyxml2::XMLError xmlDocumentParseError = xmlDocument.Parse(inBuffer.data(), receivedMessageLength);
+        tinyxml2::XMLError xmlDocumentParseError = xmlDocument.Parse(inBuffer_.data(), receivedMessageLength);
         // tinyxml2::XMLError xmlDocumentParseError = xmlDocument.Parse(XML_READ_EXAMPLE_OUTS_ARE_ZERO.c_str(), XML_READ_EXAMPLE_OUTS_ARE_ZERO.size());
         // TODO // ReH -> FoN // END // Change from test xml to real xml.
 
@@ -405,10 +439,18 @@ namespace kuka_eki_io_interface
         auto logger = rclcpp::get_logger(LOGGER_NAME);
         RCLCPP_DEBUG(logger, "write() called. Time=[%f , %li] Duration=[ %f , %li ]", time.seconds(), time.nanoseconds(), period.seconds(), period.nanoseconds());
 
-        if (isCommandUpdateRequired() && eki_write_command() == hardware_interface::return_type::ERROR) {
-            std::string msg = "Failed to write to robot EKI server within alloted time of " + std::to_string(eki_read_state_timeout_) + " seconds. Make sure eki_io_interface is running on the robot controller and all configurations are correct.";
-            RCLCPP_ERROR(logger, msg.c_str());
-            return hardware_interface::return_type::ERROR;
+        if (mutex_write_.try_lock()) {
+            if (async_write_future_.is_ready() && isCommandUpdateRequired()) {
+                // Return error based of last futures result.
+                if (async_write_future_.get() == hardware_interface::return_type::ERROR) {
+                    std::string msg = "Failed to write async to EKI server. Returning ERROR."; //  within alloted time of " + std::to_string(eki_read_state_timeout_) + " seconds. Make sure eki_io_interface is running on the robot controller and all configurations are correct.";
+                    RCLCPP_ERROR(logger, msg.c_str());
+                    return hardware_interface::return_type::ERROR;
+                }
+
+                // Write the next eki command.
+                async_write_future_ = boost::async([this]() { return eki_write_command(); });
+            }
         }
        
         return hardware_interface::return_type::OK;
