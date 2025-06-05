@@ -53,10 +53,13 @@ namespace kuka_eki_io_interface
         RCLCPP_INFO(logger, "on_activate() called. Previous state was [ %i, %s ]", previous_state.id(), previous_state.label().c_str());        
 
         //deadline_.reset(new boost::asio::deadline_timer(io_context_));
-        eki_server_socket_.reset(new boost::asio::ip::udp::socket(io_context_, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0)));
+        
 
         boost::asio::ip::udp::resolver resolver(io_context_);
         eki_server_endpoint_ = *resolver.resolve({boost::asio::ip::udp::v4(), eki_server_address_, eki_io_port_});
+
+        eki_server_socket_.reset(new boost::asio::ip::udp::socket(io_context_, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0)));
+        eki_server_socket_->open();
 
         // Initiate contact to start server. Do nothing until a read is invoked (deadline_ = +inf)
         boost::array<char, 1> ini_buf = {0};
