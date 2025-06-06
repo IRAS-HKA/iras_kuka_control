@@ -111,6 +111,7 @@ namespace kuka_eki_io_interface
             hardware_interface::return_type getCommandStateFullNameByKey(const std::string& key, std::string& fullname);
 
             void handle_receive(const boost::system::error_code& error, std::size_t bytes_transferred);
+            hardware_interface::return_type run_blocking_read_async();
             
 
             // Write commands
